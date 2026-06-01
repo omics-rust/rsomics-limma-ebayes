@@ -1,0 +1,150 @@
+//! Empirical-Bayes moderation (Smyth 2004, Stat Appl Genet Mol Biol 3:1,
+//! doi:10.2202/1544-6115.1027).
+//!
+//! squeezeVar: moment-estimate the scaled-inverse-chisquare prior (d0, s0^2)
+//! from the per-gene residual variances, then shrink each toward s0^2.
+//! Moderated t = beta / (unscaled_sd * sqrt(s2.post)); p two-sided on df.total.
+//! var.prior for the B-statistic comes from a t-mixture estimator over the
+//! largest moderated statistics, bounded by stdev.coef.lim^2 / median(s2.prior).
+
+use crate::fit::Fit;
+use crate::special::{digamma, t_pvalue_two_sided, t_quantile_upper, trigamma, trigamma_inverse};
+
+pub struct Moderated {
+    /// [gene][coef]
+    pub t: Vec<Vec<f64>>,
+    pub p: Vec<Vec<f64>>,
+    pub lods: Vec<Vec<f64>>,
+    pub df_total: f64,
+    pub df_prior: f64,
+    pub s2_prior: f64,
+}
+
+/// fitFDist: moment estimator of the prior df (df2) and scale (s20) for
+/// x ~ s20 * F(df1, df2). df1 = residual df (shared). Returns (s20, df2).
+fn fit_f_dist(x: &[f64], df1: f64) -> (f64, f64) {
+    let half = df1 / 2.0;
+    let mut e = Vec::with_capacity(x.len());
+    for &xi in x {
+        if xi > 0.0 {
+            e.push(xi.ln() - digamma(half) + half.ln());
+        }
+    }
+    let m = e.len() as f64;
+    let emean: f64 = e.iter().sum::<f64>() / m;
+    let evar: f64 = e.iter().map(|&v| (v - emean).powi(2)).sum::<f64>() / (m - 1.0);
+    let evar = evar - trigamma(half);
+    if evar > 0.0 {
+        let df2 = 2.0 * trigamma_inverse(evar);
+        let s20 = (emean + digamma(df2 / 2.0) - (df2 / 2.0).ln()).exp();
+        (s20, df2)
+    } else {
+        (emean.exp(), f64::INFINITY)
+    }
+}
+
+fn squeeze_var(sigma2: &[f64], df: f64) -> (Vec<f64>, f64, f64) {
+    let (s20, df0) = fit_f_dist(sigma2, df);
+    let s2_post: Vec<f64> = if df0.is_infinite() {
+        sigma2.iter().map(|_| s20).collect()
+    } else {
+        sigma2
+            .iter()
+            .map(|&s2| (df0 * s20 + df * s2) / (df0 + df))
+            .collect()
+    };
+    (s2_post, df0, s20)
+}
+
+/// var.prior for one coefficient column (limma tmixture.vector). df is the
+/// shared df.total; equal across genes here, so the MaxDF rescale is a no-op.
+/// Each top-probe v0 is bounded by v0_lim before averaging.
+fn tmixture_column(
+    tstat: &[f64],
+    stdev_unscaled: f64,
+    df: f64,
+    proportion: f64,
+    v0_lim: (f64, f64),
+) -> f64 {
+    let ngenes = tstat.len();
+    let ntarget = (proportion / 2.0 * ngenes as f64).ceil() as usize;
+    if ntarget < 1 {
+        return f64::NAN;
+    }
+    let p = (ntarget as f64 / ngenes as f64).max(proportion);
+
+    let mut at: Vec<f64> = tstat.iter().map(|t| t.abs()).collect();
+    at.sort_by(|a, b| b.partial_cmp(a).unwrap());
+
+    let mut v0_sum = 0.0;
+    let v1 = stdev_unscaled * stdev_unscaled;
+    for (i, &t) in at.iter().take(ntarget).enumerate() {
+        let r = (i + 1) as f64;
+        let p0 = t_pvalue_two_sided(t, df); // 2*pt(t, df, upper) = two-sided p
+        let ptarget = ((r - 0.5) / ngenes as f64 - (1.0 - p) * p0) / p;
+        let mut v0 = 0.0;
+        if ptarget > p0 {
+            let qtarget = t_quantile_upper(ptarget / 2.0, df);
+            v0 = (v1 * ((t / qtarget).powi(2) - 1.0)).max(0.0);
+        }
+        v0_sum += v0.clamp(v0_lim.0, v0_lim.1);
+    }
+    v0_sum / ntarget as f64
+}
+
+pub fn ebayes(fit: &Fit, xtx_diag_unscaled: &[f64], proportion: f64) -> Moderated {
+    let sigma2: Vec<f64> = fit.sigma.iter().map(|s| s * s).collect();
+    let (s2_post, df_prior, s2_prior) = squeeze_var(&sigma2, fit.df_residual);
+
+    let ng = fit.coefficients.len();
+    let q = fit.coef_names.len();
+
+    let df_pooled = ng as f64 * fit.df_residual;
+    let df_total = (fit.df_residual + df_prior).min(df_pooled);
+
+    let mut t = vec![vec![0.0; q]; ng];
+    let mut p = vec![vec![0.0; q]; ng];
+    for gi in 0..ng {
+        let post_sd = s2_post[gi].sqrt();
+        for cj in 0..q {
+            let tv = fit.coefficients[gi][cj] / (xtx_diag_unscaled[cj] * post_sd);
+            t[gi][cj] = tv;
+            p[gi][cj] = t_pvalue_two_sided(tv, df_total);
+        }
+    }
+
+    // var.prior.lim = stdev.coef.lim^2 / median(s2.prior); s2.prior is scalar
+    // here (no trend), so its median is itself.
+    let v0_lim = (0.1f64 * 0.1 / s2_prior, 4.0f64 * 4.0 / s2_prior);
+
+    let mut lods = vec![vec![0.0; q]; ng];
+    let const_term = (proportion / (1.0 - proportion)).ln();
+    for cj in 0..q {
+        let col_t: Vec<f64> = (0..ng).map(|gi| t[gi][cj]).collect();
+        let mut v0 = tmixture_column(&col_t, xtx_diag_unscaled[cj], df_total, proportion, v0_lim);
+        if v0.is_nan() {
+            v0 = 1.0 / s2_prior;
+        }
+
+        let u2 = xtx_diag_unscaled[cj].powi(2);
+        let r = (u2 + v0) / u2;
+        for gi in 0..ng {
+            let t2 = t[gi][cj].powi(2);
+            let kernel = if df_prior > 1e6 {
+                t2 * (1.0 - 1.0 / r) / 2.0
+            } else {
+                (1.0 + df_total) / 2.0 * ((t2 + df_total) / (t2 / r + df_total)).ln()
+            };
+            lods[gi][cj] = const_term - r.ln() / 2.0 + kernel;
+        }
+    }
+
+    Moderated {
+        t,
+        p,
+        lods,
+        df_total,
+        df_prior,
+        s2_prior,
+    }
+}
