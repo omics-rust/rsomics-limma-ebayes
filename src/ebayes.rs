@@ -39,7 +39,11 @@ fn fit_f_dist(x: &[f64], df1: f64) -> (f64, f64) {
         let s20 = (emean + digamma(df2 / 2.0) - (df2 / 2.0).ln()).exp();
         (s20, df2)
     } else {
-        (emean.exp(), f64::INFINITY)
+        // df.prior = Inf: between-gene variance vanished, so the F-moment link
+        // has no spread to invert. limma falls back to s2.prior = mean(sigma^2),
+        // the arithmetic mean of the gene variances, not exp(emean).
+        let s20 = x.iter().sum::<f64>() / x.len() as f64;
+        (s20, f64::INFINITY)
     }
 }
 
@@ -146,5 +150,29 @@ pub fn ebayes(fit: &Fit, xtx_diag_unscaled: &[f64], proportion: f64) -> Moderate
         df_total,
         df_prior,
         s2_prior,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_f_dist_infinite_prior_uses_arithmetic_mean() {
+        // Equal gene variances -> evar<=0 -> df.prior=Inf. limma sets
+        // s2.prior = mean(sigma^2). The old exp(emean) link gave ~12.04 here.
+        let s2 = vec![3.38_f64; 20];
+        let (s20, df2) = fit_f_dist(&s2, 1.0);
+        assert!(df2.is_infinite());
+        assert!((s20 - 3.38).abs() < 1e-12, "s20={s20}");
+    }
+
+    #[test]
+    fn fit_f_dist_finite_prior_link_unchanged() {
+        // Spread of variances -> evar>0 -> finite df.prior, digamma-link scale.
+        let s2 = vec![1.0, 2.0, 4.0, 0.5, 8.0, 3.0, 6.0, 1.5, 0.7, 5.0];
+        let (s20, df2) = fit_f_dist(&s2, 4.0);
+        assert!(df2.is_finite() && df2 > 0.0, "df2={df2}");
+        assert!(s20 > 0.0, "s20={s20}");
     }
 }

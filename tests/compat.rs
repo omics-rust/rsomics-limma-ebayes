@@ -66,9 +66,13 @@ fn assert_close(a: &Table, b: &Table, label: &str) {
 }
 
 fn run_ours(coef: usize) -> String {
+    run_ours_on("expr.tsv", "design.tsv", coef)
+}
+
+fn run_ours_on(expr: &str, design: &str, coef: usize) -> String {
     let out = Command::new(ours())
-        .arg(golden("expr.tsv"))
-        .args(["--design", golden("design.tsv").to_str().unwrap()])
+        .arg(golden(expr))
+        .args(["--design", golden(design).to_str().unwrap()])
         .args(["--coef", &coef.to_string()])
         .output()
         .unwrap();
@@ -88,6 +92,20 @@ fn golden_coef2() {
         &parse(&ours_out),
         &parse(&expected),
         "topTable coef2 (golden)",
+    );
+}
+
+/// Equal residual variances across genes drive the fitFDist moment estimator
+/// to evar<=0, so df.prior=Inf and limma sets s2.prior = mean(sigma^2). The
+/// committed oracle was captured from limma 3.62.1 on a df.residual=1 design.
+#[test]
+fn golden_equalvar_infinite_prior() {
+    let ours_out = run_ours_on("equalvar_expr.tsv", "equalvar_design.tsv", 2);
+    let expected = std::fs::read_to_string(golden("equalvar_top.coef2.expected.tsv")).unwrap();
+    assert_close(
+        &parse(&ours_out),
+        &parse(&expected),
+        "topTable coef2 equalvar (golden)",
     );
 }
 
