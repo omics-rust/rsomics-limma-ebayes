@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-limma-ebayes"
-version = "0.1.1"
+version = "0.1.2"
 description = "Per-gene linear model fit (lmFit) plus empirical-Bayes moderated t-statistics (eBayes) for a log-expression matrix — a clean-room Rust reimplementation of limma's lmFit + eBayes + topTable"
 edition = "2024"
 rust-version = "1.91"

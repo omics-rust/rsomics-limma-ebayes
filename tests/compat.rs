@@ -57,9 +57,16 @@ fn assert_close(a: &Table, b: &Table, label: &str) {
                 .unwrap_or_else(|| panic!("{label}: missing gene {gene}"));
         assert_eq!(x.len(), y.len(), "{label}: {gene} width mismatch");
         for (vx, vy) in x.iter().zip(y) {
-            let rel = (vx - vy).abs() / vy.abs().max(1e-9);
+            // A constant gene's logFC/t are exact 0 for us but ~1e-15 fp noise
+            // from R's QR; relative comparison there is meaningless, so a value
+            // agreeing to 1e-9 absolute is a match regardless of relative error.
+            let abs = (vx - vy).abs();
+            let rel = abs / vy.abs().max(1e-9);
             max_rel = max_rel.max(rel);
-            assert!(rel < EPS, "{label}: {gene} ours={vx} ref={vy} rel={rel:e}");
+            assert!(
+                rel < EPS || abs < 1e-9,
+                "{label}: {gene} ours={vx} ref={vy} rel={rel:e}"
+            );
         }
     }
     eprintln!("{label}: max relative deviation = {max_rel:e}");
@@ -106,6 +113,23 @@ fn golden_equalvar_infinite_prior() {
         &parse(&ours_out),
         &parse(&expected),
         "topTable coef2 equalvar (golden)",
+    );
+}
+
+/// A zero-variance (constant) gene fits perfectly, so its residual variance is
+/// exactly 0. limma floors it at 1e-5*median(sigma^2) before the fitFDist moment
+/// fit rather than dropping it, which yields a finite df.prior and shifts
+/// s2.prior — and hence the moderated t of every gene. The oracle here was
+/// captured from limma 3.62.1 on a df.residual=6 design whose first gene is
+/// constant. An earlier cut dropped the gene and reported df.prior=Inf instead.
+#[test]
+fn golden_constvar_zero_variance_gene() {
+    let ours_out = run_ours_on("constvar_expr.tsv", "constvar_design.tsv", 2);
+    let expected = std::fs::read_to_string(golden("constvar_top.coef2.expected.tsv")).unwrap();
+    assert_close(
+        &parse(&ours_out),
+        &parse(&expected),
+        "topTable coef2 constvar (golden)",
     );
 }
 

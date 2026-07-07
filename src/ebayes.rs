@@ -22,18 +22,54 @@ pub struct Moderated {
 
 /// fitFDist: moment estimator of the prior df (df2) and scale (s20) for
 /// x ~ s20 * F(df1, df2). df1 = residual df (shared). Returns (s20, df2).
+///
+/// Non-positive variances (a constant gene fits perfectly, rss=0) are not
+/// dropped: limma floors every variance at 1e-5*median(x) before the moment
+/// fit, so a zero-variance gene enters as a small outlier that shifts s2.prior
+/// and df.prior for every gene. Dropping it instead — as an earlier cut did —
+/// diverges from limma on any matrix carrying a degenerate gene.
 fn fit_f_dist(x: &[f64], df1: f64) -> (f64, f64) {
-    let half = df1 / 2.0;
-    let mut e = Vec::with_capacity(x.len());
-    for &xi in x {
-        if xi > 0.0 {
-            e.push(xi.ln() - digamma(half) + half.ln());
-        }
+    let n = x.len();
+    if n == 0 {
+        return (f64::NAN, f64::NAN);
     }
-    let m = e.len() as f64;
-    let emean: f64 = e.iter().sum::<f64>() / m;
-    let evar: f64 = e.iter().map(|&v| (v - emean).powi(2)).sum::<f64>() / (m - 1.0);
-    let evar = evar - trigamma(half);
+    if n == 1 {
+        return (x[0], 0.0);
+    }
+    let half = df1 / 2.0;
+    let df1_ok = df1.is_finite() && df1 > 1e-15;
+    let ok: Vec<f64> = if df1_ok {
+        x.iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v > -1e-15)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let nok = ok.len();
+    if nok == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+    if nok == 1 {
+        return (ok[0], 0.0);
+    }
+
+    let mut xs: Vec<f64> = ok.iter().map(|v| v.max(0.0)).collect();
+    let m = median(&xs);
+    let m = if m == 0.0 { 1.0 } else { m };
+    let floor = 1e-5 * m;
+    for v in &mut xs {
+        *v = v.max(floor);
+    }
+
+    let nf = nok as f64;
+    let e: Vec<f64> = xs
+        .iter()
+        .map(|v| v.ln() - digamma(half) + half.ln())
+        .collect();
+    let emean: f64 = e.iter().sum::<f64>() / nf;
+    let evar: f64 =
+        e.iter().map(|&v| (v - emean).powi(2)).sum::<f64>() / (nf - 1.0) - trigamma(half);
     if evar > 0.0 {
         let df2 = 2.0 * trigamma_inverse(evar);
         let s20 = (emean + digamma(df2 / 2.0) - (df2 / 2.0).ln()).exp();
@@ -41,9 +77,20 @@ fn fit_f_dist(x: &[f64], df1: f64) -> (f64, f64) {
     } else {
         // df.prior = Inf: between-gene variance vanished, so the F-moment link
         // has no spread to invert. limma falls back to s2.prior = mean(sigma^2),
-        // the arithmetic mean of the gene variances, not exp(emean).
-        let s20 = x.iter().sum::<f64>() / x.len() as f64;
-        (s20, f64::INFINITY)
+        // the arithmetic mean of the clamped gene variances, not exp(emean).
+        (xs.iter().sum::<f64>() / nf, f64::INFINITY)
+    }
+}
+
+/// Sample median: sort, middle element (odd) or mean of the two middle (even).
+fn median(x: &[f64]) -> f64 {
+    let mut s = x.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        0.5 * (s[n / 2 - 1] + s[n / 2])
     }
 }
 
@@ -174,5 +221,51 @@ mod tests {
         let (s20, df2) = fit_f_dist(&s2, 4.0);
         assert!(df2.is_finite() && df2 > 0.0, "df2={df2}");
         assert!(s20 > 0.0, "s20={s20}");
+    }
+
+    #[test]
+    fn fit_f_dist_clamps_zero_variance_gene() {
+        // A single exact-zero variance among a well-conditioned set must be
+        // floored (1e-5*median), not dropped, so the moment fit still has spread
+        // and df.prior stays finite. Dropping it collapsed df.prior to Inf.
+        let mut s2 = vec![
+            0.2000665, 0.2039878, 0.2678043, 0.2933900, 0.3335739, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0,
+            1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
+        ];
+        s2[0] = 0.0;
+        let (s20, df2) = fit_f_dist(&s2, 6.0);
+        assert!(
+            df2.is_finite() && df2 > 0.0,
+            "df2 must be finite, got {df2}"
+        );
+        assert!(s20 > 0.0 && s20 < 1.0, "s20={s20}");
+    }
+
+    #[test]
+    fn fit_f_dist_single_usable_gene_gives_ordinary_t() {
+        // nok==1 -> df2=0 (scale=that variance): moderation vanishes, moderated
+        // t reduces to the ordinary t. Matches limma on a one-gene fit.
+        let (s20, df2) = fit_f_dist(&[0.42], 6.0);
+        assert_eq!(df2, 0.0);
+        assert!((s20 - 0.42).abs() < 1e-15, "s20={s20}");
+    }
+
+    #[test]
+    fn fit_f_dist_clamp_is_noop_on_well_conditioned() {
+        // Every variance already exceeds 1e-5*median, so the floor changes
+        // nothing and the finite-prior link is bit-identical to the unclamped fit.
+        let s2 = vec![1.0, 2.0, 4.0, 0.5, 8.0, 3.0, 6.0, 1.5, 0.7, 5.0];
+        let (s20, df2) = fit_f_dist(&s2, 4.0);
+        let e: Vec<f64> = s2
+            .iter()
+            .map(|v| v.ln() - digamma(2.0) + 2.0f64.ln())
+            .collect();
+        let n = e.len() as f64;
+        let emean = e.iter().sum::<f64>() / n;
+        let evar = e.iter().map(|v| (v - emean).powi(2)).sum::<f64>() / (n - 1.0) - trigamma(2.0);
+        let df2_ref = 2.0 * trigamma_inverse(evar);
+        let s20_ref = (emean + digamma(df2_ref / 2.0) - (df2_ref / 2.0).ln()).exp();
+        assert!((df2 - df2_ref).abs() < 1e-12, "df2={df2} ref={df2_ref}");
+        assert!((s20 - s20_ref).abs() < 1e-12, "s20={s20} ref={s20_ref}");
     }
 }
