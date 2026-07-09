@@ -1,9 +1,7 @@
-//! Special functions for the eBayes moment estimator and t-distribution.
+//! Special functions for the t-distribution used by eBayes moderation.
 //!
-//! digamma / trigamma use the asymptotic series with recurrence shift-up,
-//! matching R's implementations to ~1e-12. trigamma_inverse is Smyth's Newton
-//! scheme (Smyth 2004, appendix). Student-t tail uses the regularized
-//! incomplete beta via Lentz continued fraction.
+//! Student-t tail uses the regularized incomplete beta via Lentz continued
+//! fraction. digamma/trigamma/trigamma_inverse live in rsomics-ebayes-core.
 
 pub fn ln_gamma(x: f64) -> f64 {
     // Lanczos g=607/128, n=15
@@ -37,73 +35,6 @@ pub fn ln_gamma(x: f64) -> f64 {
         }
         0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
     }
-}
-
-pub fn digamma(mut x: f64) -> f64 {
-    let mut result = 0.0;
-    while x < 20.0 {
-        result -= 1.0 / x;
-        x += 1.0;
-    }
-    let inv = 1.0 / x;
-    let inv2 = inv * inv;
-    result + x.ln()
-        - 0.5 * inv
-        - inv2
-            * (1.0 / 12.0
-                - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 / 132.0))))
-}
-
-pub fn trigamma(mut x: f64) -> f64 {
-    let mut result = 0.0;
-    while x < 20.0 {
-        result += 1.0 / (x * x);
-        x += 1.0;
-    }
-    let inv = 1.0 / x;
-    let inv2 = inv * inv;
-    result
-        + inv
-            * (1.0
-                + inv
-                    * (0.5
-                        + inv
-                            * (1.0 / 6.0
-                                - inv2 * (1.0 / 30.0 - inv2 * (1.0 / 42.0 - inv2 / 30.0)))))
-}
-
-/// Solve trigamma(y) = x for y. Smyth's Newton iteration on 1/x scale.
-pub fn trigamma_inverse(x: f64) -> f64 {
-    if x > 1e7 {
-        return 1.0 / x.sqrt();
-    }
-    if x < 1e-6 {
-        return 1.0 / x;
-    }
-    let mut y = 0.5 + 1.0 / x;
-    loop {
-        let tri = trigamma(y);
-        let dif = tri * (1.0 - tri / x) / psigamma2(y);
-        y += dif;
-        if -dif / y < 1e-8 {
-            break;
-        }
-    }
-    y
-}
-
-/// Second derivative of digamma = third derivative of ln Gamma (psigamma deriv 2).
-fn psigamma2(mut x: f64) -> f64 {
-    let mut result = 0.0;
-    while x < 20.0 {
-        result -= 2.0 / (x * x * x);
-        x += 1.0;
-    }
-    let inv = 1.0 / x;
-    let x2 = x * x;
-    // psi''(x) ~ -1/x^2 - 1/x^3 - 1/(2 x^4) + 1/(6 x^6) - 1/(6 x^8) + ...
-    -1.0 / x2 - 1.0 / (x2 * x) - 0.5 * inv * inv * inv * inv + result + inv.powi(6) / 6.0
-        - inv.powi(8) / 6.0
 }
 
 /// Two-sided Student-t p-value: P(|T_df| >= |t|).
@@ -235,6 +166,7 @@ fn betacf(a: f64, b: f64, x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsomics_ebayes_core::{digamma, trigamma, trigamma_inverse};
 
     #[test]
     fn digamma_known() {

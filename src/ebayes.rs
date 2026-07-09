@@ -8,7 +8,8 @@
 //! largest moderated statistics, bounded by stdev.coef.lim^2 / median(s2.prior).
 
 use crate::fit::Fit;
-use crate::special::{digamma, t_pvalue_two_sided, t_quantile_upper, trigamma, trigamma_inverse};
+use crate::special::{t_pvalue_two_sided, t_quantile_upper};
+use rsomics_ebayes_core::fit_f_dist;
 
 pub struct Moderated {
     /// [gene][coef]
@@ -18,80 +19,6 @@ pub struct Moderated {
     pub df_total: f64,
     pub df_prior: f64,
     pub s2_prior: f64,
-}
-
-/// fitFDist: moment estimator of the prior df (df2) and scale (s20) for
-/// x ~ s20 * F(df1, df2). df1 = residual df (shared). Returns (s20, df2).
-///
-/// Non-positive variances (a constant gene fits perfectly, rss=0) are not
-/// dropped: limma floors every variance at 1e-5*median(x) before the moment
-/// fit, so a zero-variance gene enters as a small outlier that shifts s2.prior
-/// and df.prior for every gene. Dropping it instead — as an earlier cut did —
-/// diverges from limma on any matrix carrying a degenerate gene.
-fn fit_f_dist(x: &[f64], df1: f64) -> (f64, f64) {
-    let n = x.len();
-    if n == 0 {
-        return (f64::NAN, f64::NAN);
-    }
-    if n == 1 {
-        return (x[0], 0.0);
-    }
-    let half = df1 / 2.0;
-    let df1_ok = df1.is_finite() && df1 > 1e-15;
-    let ok: Vec<f64> = if df1_ok {
-        x.iter()
-            .copied()
-            .filter(|v| v.is_finite() && *v > -1e-15)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let nok = ok.len();
-    if nok == 0 {
-        return (f64::NAN, f64::NAN);
-    }
-    if nok == 1 {
-        return (ok[0], 0.0);
-    }
-
-    let mut xs: Vec<f64> = ok.iter().map(|v| v.max(0.0)).collect();
-    let m = median(&xs);
-    let m = if m == 0.0 { 1.0 } else { m };
-    let floor = 1e-5 * m;
-    for v in &mut xs {
-        *v = v.max(floor);
-    }
-
-    let nf = nok as f64;
-    let e: Vec<f64> = xs
-        .iter()
-        .map(|v| v.ln() - digamma(half) + half.ln())
-        .collect();
-    let emean: f64 = e.iter().sum::<f64>() / nf;
-    let evar: f64 =
-        e.iter().map(|&v| (v - emean).powi(2)).sum::<f64>() / (nf - 1.0) - trigamma(half);
-    if evar > 0.0 {
-        let df2 = 2.0 * trigamma_inverse(evar);
-        let s20 = (emean + digamma(df2 / 2.0) - (df2 / 2.0).ln()).exp();
-        (s20, df2)
-    } else {
-        // df.prior = Inf: between-gene variance vanished, so the F-moment link
-        // has no spread to invert. limma falls back to s2.prior = mean(sigma^2),
-        // the arithmetic mean of the clamped gene variances, not exp(emean).
-        (xs.iter().sum::<f64>() / nf, f64::INFINITY)
-    }
-}
-
-/// Sample median: sort, middle element (odd) or mean of the two middle (even).
-fn median(x: &[f64]) -> f64 {
-    let mut s = x.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = s.len();
-    if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    }
 }
 
 fn squeeze_var(sigma2: &[f64], df: f64) -> (Vec<f64>, f64, f64) {
@@ -203,6 +130,7 @@ pub fn ebayes(fit: &Fit, xtx_diag_unscaled: &[f64], proportion: f64) -> Moderate
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsomics_ebayes_core::{digamma, trigamma, trigamma_inverse};
 
     #[test]
     fn fit_f_dist_infinite_prior_uses_arithmetic_mean() {
